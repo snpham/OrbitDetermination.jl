@@ -1,8 +1,11 @@
 module OrbitDetermination
 
-export greet_your_package_name
-include("functions.jl")
+include("constants.jl")
+include("conics.jl")
+# include("functions.jl")
 
-# Write your package code here.
+using .Constants
+using .Conics
+# using .Functions
 
 end
