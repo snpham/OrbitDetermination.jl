@@ -2,25 +2,24 @@ module Conics
 
 using LinearAlgebra
 include("constants.jl")
+include("rotations.jl")
+include("matrices.jl")
 using .Constants
+using .Rotations
+using .Matrix
+using Base.Math: sin, cos, sqrt
 
 mutable struct OrbitalElements
-    mu::Float64
-    rvec::Vector{Float64}
-    vvec::Vector{Float64}
-    r_mag::Float64
-    v_mag::Float64
+    sma::Float64
+    e_mag::Float64
+    incl::Float64
+    raan::Float64
+    argp::Float64
+    ta::Float64
     r_hat::Vector{Float64}
     v_hat::Vector{Float64}
-    h_vec::Vector{Float64}
-    h_mag::Float64
     h_hat::Vector{Float64}
-    node_vec::Vector{Float64}
-    node_mag::Float64
-    e_vec::Vector{Float64}
-    e_mag::Float64
     e_hat::Vector{Float64}
-    oe::Vector{Float64}
 end
 
 function OrbitalElements(rvec::Vector{Float64}, vvec::Vector{Float64}, center::String="earth")
@@ -42,16 +41,13 @@ function OrbitalElements(rvec::Vector{Float64}, vvec::Vector{Float64}, center::S
     e_mag = norm(e_vec)
     e_hat = e_vec / e_mag
 
-    oe = [
-        semimajor_axis(mu, h_mag, e_mag),
-        e_mag,
-        rad2deg(inclination(h_vec, h_mag)),
-        rad2deg(raan(node_vec, node_mag, inclination(h_vec, h_mag))),
-        rad2deg(aop(node_vec, node_mag, e_vec, e_mag)),
-        rad2deg(true_anomaly(e_vec, e_mag, rvec, r_mag, vvec))
-    ]
+    sma = semimajor_axis(mu, h_mag, e_mag)
+    incl = rad2deg(inclination(h_vec, h_mag))
+    rasc = rad2deg(raan(node_vec, node_mag, inclination(h_vec, h_mag)))
+    argp = rad2deg(aop(node_vec, node_mag, e_vec, e_mag))
+    ta = rad2deg(true_anomaly(e_vec, e_mag, rvec, r_mag, vvec))
 
-    return OrbitalElements(mu, rvec, vvec, r_mag, v_mag, r_hat, v_hat, h_vec, h_mag, h_hat, node_vec, node_mag, e_vec, e_mag, e_hat, oe)
+    return OrbitalElements(sma, e_mag, incl, rasc, argp, ta, r_hat, v_hat, h_hat, e_hat)
 end
 
 function eccentricity_vector(rvec, vvec, mu, r_mag, v_mag)
@@ -120,6 +116,91 @@ end
 
 function ra(semimajor_axis, e_mag)
     return semimajor_axis * (1 + e_mag)
+end
+
+function get_rv_frm_elements(elements, center::String="earth", method::String="sma")
+    """
+    Computes position/velocity vectors from orbital elements.
+    We first compute pos/vel in the PQW system, then rotate to the
+    geocentric equatorial system.
+
+    Parameters:
+    elements - for method = 'p': (p, e, i, raan, aop, ta)
+               for method = 'sma': (a, e, i, raan, aop, ta)
+    a: semi-major axis (km); e: eccentricity
+    i: inclination (rad); raan: right ascending node (rad)
+    aop: argument of periapsis (rad); ta: true anomaly (rad)
+    center: center object of orbit; default=earth
+
+    Returns:
+    rvec: positional vectors of spacecraft [IJK] (km)
+    vvec: velocity vectors of spacecraft [IJK] (km/s)
+    """
+
+    if method == "p"
+        p, e, i, raan, aop, ta = elements
+    elseif method == "sma"
+        a, e, i, raan, aop, ta = elements
+        p = a * (1 - e^2)
+    else
+        throw(ArgumentError("Invalid method. Use 'p' or 'sma'."))
+    end
+
+    # Determine which planet center to compute from
+    mu = Constants.mu(center)
+
+    if method == "sma"
+        r = p / (1 + e * cos(ta))
+        h = sqrt(mu * a * (1 - e^2))
+        rvec = [
+            r * (cos(raan) * cos(aop + ta) - sin(raan) * sin(aop + ta) * cos(i)),
+            r * (sin(raan) * cos(aop + ta) + cos(raan) * sin(aop + ta) * cos(i)),
+            r * (sin(i) * sin(aop + ta))
+        ]
+        vvec = [
+            rvec[1] * h * e * sin(ta) / (r * p) - h / r * (cos(raan) * sin(aop + ta) + sin(raan) * cos(aop + ta) * cos(i)),
+            rvec[2] * h * e * sin(ta) / (r * p) - h / r * (sin(raan) * sin(aop + ta) - cos(raan) * cos(aop + ta) * cos(i)),
+            rvec[3] * h * e * sin(ta) / (r * p) + h / r * (sin(i) * cos(aop + ta))
+        ]
+        return vcat(rvec, vvec)
+
+    elseif method == "p"
+        # Assigning temporary variables
+        aop_t = aop
+        raan_t = raan
+        ta_t = ta 
+
+        # Checking for undefined states 
+        if e == 0 && i == 0
+            aop_t = 0.0
+            raan_t = 0.0
+            ta_t = aop_t + raan_t + ta
+        elseif e == 0
+            aop_t = 0.0
+            ta_t = aop_t + ta
+        elseif i == 0
+            raan_t = 0.0
+            aop_t = raan_t + aop
+            ta_t = ta
+        end
+
+        # Converting elements into state vectors in PQW frame
+        r_pqw = [p * cos(ta_t) / (1 + e * cos(ta_t)), p * sin(ta_t) / (1 + e * cos(ta_t)), 0.0]
+        v_pqw = [-sqrt(mu / p) * sin(ta_t), sqrt(mu / p) * (e + cos(ta_t)), 0.0]
+        
+        # Get 313 transformation matrix to geocentric-equatorial frame
+        m1 = Rotations.rotate(-aop, 'z')
+        m2 = Rotations.rotate(-i, 'x')
+        m3 = Rotations.rotate(-raan, 'z')
+        T_ijk_pqw = Matrix.mxm(m3, Matrix.mxm(m2, m1))
+
+        # state vector from PQW to ECI
+        r_ijk = Matrix.mxv(T_ijk_pqw, r_pqw)
+        v_ijk = Matrix.mxv(T_ijk_pqw, v_pqw)
+        return vcat(r_ijk, v_ijk)
+    else
+        throw(ArgumentError("Invalid method. Use 'p' or 'sma'."))
+    end
 end
 
 # Example usage (assuming Constants.mu is defined)
